@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       versao:
-        description: 'Versão (ex.: 1.0.1). Vazio = a do app/build.gradle.kts'
+        description: 'Versao (ex.: 1.1). Vazio = a do app/build.gradle.kts'
         required: false
         default: ''
       publicar:
-        description: 'Publicar o APK numa Release (v<versão>)'
+        description: 'Publicar o APK numa Release (v<versao>)'
         type: boolean
         required: false
         default: false
@@ -93,8 +93,8 @@ jobs:
             V=$(grep -oE 'versionName *= *"[^"]+"' "$ROOT_PROJECT_DIR/app/build.gradle.kts" | head -n 1 | sed -E 's/.*"([^"]+)".*/\1/' || true)
           fi
           if ! echo "$V" | grep -Eq '^[0-9]+(\.[0-9]+){0,2}$'; then
-            [ -n "$V" ] && echo "Versao '$V' invalida; a usar 1.0.0"
-            V="1.0.0"
+            [ -n "$V" ] && echo "Versao '$V' invalida; a usar 1.0"
+            V="1.0"
           fi
           echo "APP_VERSION=$V" >> "$GITHUB_ENV"
           echo "Versao do APK: $V"
@@ -105,6 +105,17 @@ jobs:
           sed -i -E "s/versionName *= *\"[^\"]*\"/versionName = \"$APP_VERSION\"/" "$F"
           sed -i -E "s/versionCode *= *[0-9]+/versionCode = ${GITHUB_RUN_NUMBER}/" "$F"
           grep -E "versionName|versionCode" "$F"
+
+      # O app procura atualizacoes nos Releases DESTE repositorio: o nome e' escrito no codigo na compilacao.
+      - name: Configurar repositorio das atualizacoes
+        run: |
+          U=$(find "$ROOT_PROJECT_DIR" -name Updater.kt | head -n 1)
+          if [ -n "$U" ]; then
+            sed -i "s#OWNER/REPO#${GITHUB_REPOSITORY}#g" "$U"
+            grep -n "const val REPO" "$U"
+          else
+            echo "::warning::Updater.kt nao encontrado; o app nao vai procurar atualizacoes."
+          fi
 
       - name: Compilar APK
         run: |
