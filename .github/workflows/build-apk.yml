@@ -1,0 +1,179 @@
+name: Compilar Chats Android
+
+on:
+  workflow_dispatch:
+    inputs:
+      versao:
+        description: 'Versao (ex.: 1.1). Vazio = a do app/build.gradle.kts'
+        required: false
+        default: ''
+      publicar:
+        description: 'Publicar o APK numa Release (v<versao>)'
+        type: boolean
+        required: false
+        default: false
+  release:
+    types: [published]
+  push:
+    paths:
+      - '*.zip'
+      - 'settings.gradle.kts'
+      - 'build.gradle.kts'
+      - 'app/**'
+      - '.github/workflows/build-apk.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Obter ficheiros do repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Instalar plataforma Android (SDK ja vem no runner)
+        run: |
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          [ -x "$SDKM" ] || SDKM="$(command -v sdkmanager)"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Configurar Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+
+      - name: Localizar projeto (extrai o ZIP se necessario)
+        run: |
+          rm -rf extracted_project
+          if [ -f settings.gradle.kts ] || [ -f settings.gradle ]; then
+            echo "Projeto encontrado na raiz do repositorio"
+            mkdir extracted_project
+            shopt -s dotglob
+            for f in *; do
+              if [ "$f" != "extracted_project" ] && [ "$f" != ".git" ] && [ "$f" != "dist" ]; then cp -r "$f" extracted_project/; fi
+            done
+          else
+            # Varios ZIPs? Prefere Chats_android.zip; senao usa o mais recente
+            Z=""
+            if [ -f Chats_android.zip ]; then Z="Chats_android.zip"
+            else Z=$(ls -1t ./*.zip 2>/dev/null | head -n 1 || true)
+            fi
+            if [ -z "$Z" ]; then
+              echo "Erro: nenhum .zip encontrado na raiz do repositorio!"
+              exit 1
+            fi
+            echo "A extrair $Z"
+            unzip -q -o "$Z" -d extracted_project -x "__MACOSX/*" "*/.DS_Store"
+          fi
+          # Pasta do projeto = a do settings.gradle(.kts) menos profunda (o ZIP traz tudo dentro de Chats/)
+          SETTINGS=$(find extracted_project -not -path '*/__MACOSX/*' \( -name "settings.gradle.kts" -o -name "settings.gradle" \) | awk -F/ '{print NF" "$0}' | sort -n | head -n 1 | cut -d' ' -f2-)
+          if [ -z "$SETTINGS" ]; then
+            echo "Erro: settings.gradle.kts nao encontrado no projeto!"
+            exit 1
+          fi
+          ROOT_PROJECT_DIR=$(dirname "$SETTINGS")
+          echo "ROOT_PROJECT_DIR=$ROOT_PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Projeto em: $ROOT_PROJECT_DIR"
+          for need in app/build.gradle.kts app/src/main/AndroidManifest.xml; do
+            [ -f "$ROOT_PROJECT_DIR/$need" ] || { echo "Erro: $need em falta no projeto!"; exit 1; }
+          done
+          # A chave de assinatura fixa tem de vir no projeto: sem ela as atualizacoes deixam de instalar por cima
+          if grep -q "chats-release.jks" "$ROOT_PROJECT_DIR/app/build.gradle.kts" && [ ! -f "$ROOT_PROJECT_DIR/app/chats-release.jks" ]; then
+            echo "Erro: app/chats-release.jks em falta no ZIP (chave de assinatura)!"
+            exit 1
+          fi
+
+      - name: Definir versao
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          INPUT_VERSAO: ${{ github.event.inputs.versao }}
+        run: |
+          V=""
+          if [ -n "$RELEASE_TAG" ]; then V="${RELEASE_TAG#[vV]}"
+          elif [ -n "$INPUT_VERSAO" ]; then V="${INPUT_VERSAO#[vV]}"
+          else
+            V=$(grep -oE 'versionName *= *"[^"]+"' "$ROOT_PROJECT_DIR/app/build.gradle.kts" | head -n 1 | sed -E 's/.*"([^"]+)".*/\1/' || true)
+          fi
+          if ! echo "$V" | grep -Eq '^[0-9]+(\.[0-9]+){0,2}$'; then
+            [ -n "$V" ] && echo "Versao '$V' invalida; a usar 1.0"
+            V="1.0"
+          fi
+          echo "APP_VERSION=$V" >> "$GITHUB_ENV"
+          echo "Versao do APK: $V"
+
+      - name: Aplicar versao ao projeto
+        run: |
+          F="$ROOT_PROJECT_DIR/app/build.gradle.kts"
+          sed -i -E "s/versionName *= *\"[^\"]*\"/versionName = \"$APP_VERSION\"/" "$F"
+          sed -i -E "s/versionCode *= *[0-9]+/versionCode = ${GITHUB_RUN_NUMBER}/" "$F"
+          grep -E "versionName|versionCode" "$F"
+
+      # O app procura atualizacoes nos Releases DESTE repositorio: o nome e' escrito no codigo na compilacao.
+      - name: Configurar repositorio das atualizacoes
+        run: |
+          U=$(find "$ROOT_PROJECT_DIR" -name Updater.kt | head -n 1)
+          if [ -n "$U" ]; then
+            sed -i "s#OWNER/REPO#${GITHUB_REPOSITORY}#g" "$U"
+            grep -n "const val REPO" "$U"
+          else
+            echo "::warning::Updater.kt nao encontrado; o app nao vai procurar atualizacoes."
+          fi
+
+      - name: Compilar APK
+        run: |
+          cd "$ROOT_PROJECT_DIR"
+          set -o pipefail
+          gradle :app:assembleRelease :app:assembleDebug --no-daemon --console=plain 2>&1 | tee build.log || {
+            echo "===== ERROS DE COMPILACAO ====="
+            grep -E "^e: |What went wrong" -A4 build.log | head -80
+            exit 1
+          }
+
+      - name: Preparar APK
+        run: |
+          REL=$(ls "$ROOT_PROJECT_DIR"/app/build/outputs/apk/release/*.apk | head -n 1)
+          DBG=$(ls "$ROOT_PROJECT_DIR"/app/build/outputs/apk/debug/*.apk | head -n 1)
+          mkdir -p dist
+          cp "$REL" dist/Chats.apk
+          cp "$DBG" dist/Chats-debug.apk
+          ls -l dist
+          APKSIGNER=$(ls "$ANDROID_HOME"/build-tools/*/apksigner 2>/dev/null | sort -V | tail -n 1 || true)
+          if [ -n "$APKSIGNER" ]; then
+            "$APKSIGNER" verify --print-certs dist/Chats.apk | grep -E "Signer #1 certificate (DN|SHA-256)" || true
+          fi
+
+      - name: Disponibilizar APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Chats-APK
+          path: dist/*.apk
+          if-no-files-found: error
+
+      - name: Anexar APK a Release
+        if: github.event_name == 'release' || github.event.inputs.publicar == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          TAG="${RELEASE_TAG:-v$APP_VERSION}"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$TAG" dist/Chats.apk --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" dist/Chats.apk --repo "$GITHUB_REPOSITORY" \
+              --title "Chats $APP_VERSION" --notes "Chats $APP_VERSION"
+          fi
+          echo "APK publicado em $TAG"
